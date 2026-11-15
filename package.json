@@ -1,0 +1,21 @@
+{
+  "name": "idena.social-mod",
+  "version": "1.0.0",
+  "description": "Content moderation smart contract for idena.social",
+  "private": true,
+  "scripts": {
+    "asbuild:release": "asb build --target release",
+    "asbuild:test": "asb build --target test",
+    "asbuild": "yarn asbuild:release && yarn asbuild:test",
+    "test": "yarn asbuild && jest --runInBand"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "assemblyscript": "^0.27.29",
+    "jest": "^29.7.0"
+  },
+  "dependencies": {
+    "as-proto": "^0.2.5",
+    "idena-sdk-as": "0.0.29"
+  }
+}
