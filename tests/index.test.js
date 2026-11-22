@@ -70,6 +70,20 @@ function errorsOf(receipt) {
     return errors;
 }
 
+// Identity lookups the call made, including ones made from callbacks.
+function identityLookupsOf(receipt) {
+    const IDENTITY_PROMISE = 5;
+    let count = 0;
+    const walk = (result) => {
+        for (const sub of result.subActionResults || []) {
+            if (sub.inputAction.actionType === IDENTITY_PROMISE) count++;
+            walk(sub);
+        }
+    };
+    walk(receipt.actionResult);
+    return count;
+}
+
 // The runner doesn't enable consensus Upgrade 12, so events emitted in a nested callback are reported twice. Mainnet
 // reports them once.
 function eventsOf(receipt, name) {
@@ -104,6 +118,16 @@ async function readList(contract, prefix, key) {
     }
 }
 
+// The epoch an identity lookup last confirmed `address` as a staker, or null.
+async function readStakeEpoch(contract, address) {
+    try {
+        return u16Of(await provider.Contract.readMap(contract, 's:', hexOf(address), 'hex'));
+    } catch (error) {
+        if (error.message === 'data is nil') return null;
+        throw error;
+    }
+}
+
 const seed = (contract, key, value) => provider.Chain.setContractData(contract, key, JSON.stringify(value), 'string');
 const seedTransactionBan = (contract, hash) => seed(contract, `t:${hash}`, { moderator: randomAddress(), epoch: EPOCH, reason: '' });
 const seedBan = (contract, address, ban) =>
@@ -124,6 +148,12 @@ const seedVouchRecord = (contract, address, voucher) =>
 async function seedVouchers(contract, address, vouchers) {
     await seedList(contract, `m:${address}`, vouchers);
     for (const voucher of vouchers) await seedVouchRecord(contract, address, voucher);
+}
+// Records `address` as confirmed to have moderator stake in `epoch`, as an identity lookup would.
+function seedStakeEpoch(contract, address, epoch = EPOCH) {
+    const value = Buffer.alloc(2);
+    value.writeUInt16LE(epoch);
+    return provider.Chain.setContractData(contract, `s:${address}`, `0x${value.toString('hex')}`, 'hex');
 }
 // Makes `address` a vouched moderator, vouched for by some other staker.
 const seedVouched = (contract, address) => seedVouchers(contract, address, [randomAddress()]);
@@ -157,6 +187,9 @@ describe('release build: no identity has 1M stake', () => {
         receipt = await call(contract, 'unbanTransaction', { hash });
         expect(errorsOf(receipt)).toContainEqual(expect.stringContaining('only moderators can unban transactions'));
         expect(await isTransactionBanned(contract, hash)).toBe(true);
+
+        // A failed stake check isn't remembered.
+        expect(await readStakeEpoch(contract, god)).toBeNull();
     });
 
     it('rejects moderation by an address that is neither staked nor vouched', async () => {
@@ -381,6 +414,90 @@ describe('release build: no identity has 1M stake', () => {
         });
     });
 
+    describe('as a staker confirmed this epoch', () => {
+        beforeEach(async () => {
+            await seedStakeEpoch(contract, god);
+        });
+
+        it('moderates without looking itself up', async () => {
+            const hash = randomHash();
+            let receipt = await call(contract, 'banTransaction', { hash });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(0);
+            expect(await isTransactionBanned(contract, hash)).toBe(true);
+
+            receipt = await call(contract, 'unbanTransaction', { hash });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(0);
+            expect(await isTransactionBanned(contract, hash)).toBe(false);
+
+            const hashes = [randomHash(), randomHash()];
+            receipt = await call(contract, 'banTransactions', { hashes });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(0);
+            expect(await isTransactionBanned(contract, hashes[1])).toBe(true);
+
+            // A ban still looks up its target, to check it isn't a staker.
+            const target = randomAddress();
+            receipt = await call(contract, 'ban', { address: target });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(1);
+            expect(await isBanned(contract, target)).toBe(true);
+
+            receipt = await call(contract, 'unban', { address: target });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(0);
+            expect(await isBanned(contract, target)).toBe(false);
+        });
+
+        it('vouches and revokes vouches without looking itself up', async () => {
+            const target = randomAddress();
+            let receipt = await call(contract, 'vouch', { address: target });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(0);
+            expect(u32Of(eventsOf(receipt, 'vouch')[0][2])).toBe(1);
+            expect(await hasVouched(contract, god, target)).toBe(true);
+
+            receipt = await call(contract, 'revokeVouches', { address: target });
+            expect(errorsOf(receipt)).toEqual([]);
+            expect(identityLookupsOf(receipt)).toBe(0);
+            expect(u32Of(eventsOf(receipt, 'vouchesRevoked')[0][2])).toBe(1);
+            expect(await vouchCount(contract, target)).toBe(0);
+        });
+
+        it('cannot be banned', async () => {
+            const target = randomAddress();
+            await seedStakeEpoch(contract, target);
+
+            const receipt = await call(contract, 'ban', { address: target });
+            expect(receipt.success).toBe(false);
+            expect(receipt.error).toContain('cannot ban a moderator');
+        });
+
+        it('cannot moderate while banned', async () => {
+            await seedBan(contract, god, { permanent: true });
+
+            const receipt = await call(contract, 'banTransaction', { hash: randomHash() });
+            expect(receipt.success).toBe(false);
+            expect(receipt.error).toContain('banned addresses cannot moderate');
+        });
+    });
+
+    it('looks up a staker confirmed in a different epoch again', async () => {
+        // The runner stays in epoch 0, so a confirmation from any other epoch stands in for one that has expired.
+        await seedStakeEpoch(contract, god, EPOCH + 1);
+        const target = randomAddress();
+
+        let receipt = await call(contract, 'banTransaction', { hash: randomHash() });
+        expect(identityLookupsOf(receipt)).toBe(1);
+        expect(errorsOf(receipt)).toContainEqual(expect.stringContaining('only moderators can ban transactions'));
+
+        receipt = await call(contract, 'vouch', { address: target });
+        expect(identityLookupsOf(receipt)).toBe(1);
+        expect(errorsOf(receipt)).toContainEqual(expect.stringContaining('only identities with 1M+ iDNA stake can vouch'));
+        expect(await vouchCount(contract, target)).toBe(0);
+    });
+
     describe('reports', () => {
         it('lets anyone report an address, without storing anything', async () => {
             const target = randomAddress();
@@ -491,6 +608,11 @@ describe('release build: no identity has 1M stake', () => {
         expect(receipt.error).toContain('direct call to promise callback is forbidden');
         expect(await vouchCount(contract, target)).toBe(0);
     });
+
+    it('keeps no fields in the contract class', async () => {
+        // Every call and callback loads and parses the class's fields, so the maps are module constants instead.
+        expect(await provider.Contract.readData(contract, 'STATE', 'string')).toBe('{}');
+    });
 });
 
 describe('test build: every identity counts as a 1M+ staker', () => {
@@ -527,6 +649,21 @@ describe('test build: every identity counts as a 1M+ staker', () => {
         expect(await hasVouched(contract, god, target)).toBe(false);
         expect(await readList(contract, 'm:', target)).toBeNull();
         expect(await readList(contract, 'v:', god)).toBeNull();
+    });
+
+    it('looks a staker up once per epoch', async () => {
+        let receipt = await call(contract, 'banTransaction', { hash: randomHash() });
+        expect(errorsOf(receipt)).toEqual([]);
+        expect(identityLookupsOf(receipt)).toBe(1);
+        expect(await readStakeEpoch(contract, god)).toBe(EPOCH);
+
+        receipt = await call(contract, 'banTransaction', { hash: randomHash() });
+        expect(errorsOf(receipt)).toEqual([]);
+        expect(identityLookupsOf(receipt)).toBe(0);
+
+        receipt = await call(contract, 'vouch', { address: randomAddress() });
+        expect(errorsOf(receipt)).toEqual([]);
+        expect(identityLookupsOf(receipt)).toBe(0);
     });
 
     it('lists who vouched for an address', async () => {
@@ -613,10 +750,10 @@ describe('test build: every identity counts as a 1M+ staker', () => {
         expect(await readList(contract, 'm:', b)).toBeNull();
     });
 
-    it('has enough gas by default to vouch with a full list for an address with 29 vouchers', async () => {
+    it('has enough gas by default to vouch with a full list for an address with 45 vouchers', async () => {
         // Only the target's own voucher list is read in full, so that's the one that's made long. The other stakers'
         // vouch records don't matter here, so only their list entries are seeded.
-        const othersVouchers = () => Array.from({ length: 29 }, randomAddress);
+        const othersVouchers = () => Array.from({ length: 45 }, randomAddress);
         const vouchees = Array.from({ length: 4 }, randomAddress);
         await seedList(contract, `v:${god}`, vouchees);
         for (const vouchee of vouchees) {

@@ -34,7 +34,7 @@ const GAS_PER_BATCHED_BAN: u32 = 2_000_000;
 
 const IDENTITY_PROMISE_GAS: u32 = 20_000;
 // Covers every callback with room to spare, except that vouching for or revoking an address costs about 60k more per
-// voucher it already has: with this default that works up to roughly 40 vouchers (vouch) or 60 (revoke), beyond which
+// voucher it already has: with this default that works up to roughly 50 vouchers (vouch) or 65 (revoke), beyond which
 // callers pass a higher _gasLimit. Only gas actually used is charged, but the transaction's maxFee must cover the
 // reservation.
 const DEFAULT_CALLBACK_GAS: u32 = 4_000_000;
@@ -133,7 +133,8 @@ function lookupIdentity(address: Address, callback: string, args: Bytes[], gasLi
     Host.createGetIdentityPromise(address, IDENTITY_PROMISE_GAS).then(callback, args, Balance.Zero, gasLimit);
 }
 
-// Only valid inside a `lookupIdentity` callback.
+// Only valid inside a `lookupIdentity` callback. To check a moderator, use `requireLookedUpStake`, which also remembers
+// the result for the rest of the epoch.
 function lookedUpIdentityHasModeratorStake(): bool {
     const result = Host.promiseResult();
     util.assert(!result.failed(), 'identity lookup failed');
@@ -186,27 +187,27 @@ function withoutAddressAt(list: Uint8Array, index: i32): Uint8Array {
     return result;
 }
 
-export class IdenaSocialMod {
-    // Every map is keyed by lowercase 0x address.
-    bans: PersistentMap<string, Ban>;
-    // Keyed by lowercase 0x transaction hash.
-    transactionBans: PersistentMap<string, TransactionBan>;
-    // Each address's current vouchers. A vouch is in effect exactly while its voucher is listed here.
-    vouchers: PersistentMap<string, Uint8Array>;
-    // The addresses each staker has vouched for, to enforce MAX_VOUCHES. After a revocation an address can linger here
-    // until the list is next written; it only counts while its vouch record still exists.
-    vouchesGiven: PersistentMap<string, Uint8Array>;
-    // Keyed '<address>:<voucher>', present exactly while that vouch is in effect. Checking it is far cheaper than
-    // reading the address's whole voucher list, since storage reads are charged per byte.
-    vouchRecords: PersistentMap<string, u8>;
+// The contract's storage. The maps are module constants rather than fields of the contract class because every call and
+// callback loads the class's fields from storage and parses them, maps included: as fields, each map added about 1,250
+// gas to every call and callback. Every map is keyed by lowercase 0x address unless noted.
+const bans = PersistentMap.withStringPrefix<string, Ban>('b:');
+// Keyed by lowercase 0x transaction hash.
+const transactionBans = PersistentMap.withStringPrefix<string, TransactionBan>('t:');
+// Each address's current vouchers. A vouch is in effect exactly while its voucher is listed here.
+const vouchers = PersistentMap.withStringPrefix<string, Uint8Array>('m:');
+// The addresses each staker has vouched for, to enforce MAX_VOUCHES. After a revocation an address can linger here until
+// the list is next written; it only counts while its vouch record still exists.
+const vouchesGiven = PersistentMap.withStringPrefix<string, Uint8Array>('v:');
+// Keyed '<address>:<voucher>', present exactly while that vouch is in effect. Checking it is far cheaper than reading
+// the address's whole voucher list, since storage reads are charged per byte.
+const vouchRecords = PersistentMap.withStringPrefix<string, u8>('p:');
+// The epoch an identity lookup last found each address with MODERATOR_STAKE. For the rest of that epoch it moderates
+// without a lookup. Only stakers are stored: stake can be added at any time, so a failed check isn't remembered.
+const stakeEpochs = PersistentMap.withStringPrefix<string, u16>('s:');
 
-    constructor() {
-        this.bans = PersistentMap.withStringPrefix<string, Ban>('b:');
-        this.transactionBans = PersistentMap.withStringPrefix<string, TransactionBan>('t:');
-        this.vouchers = PersistentMap.withStringPrefix<string, Uint8Array>('m:');
-        this.vouchesGiven = PersistentMap.withStringPrefix<string, Uint8Array>('v:');
-        this.vouchRecords = PersistentMap.withStringPrefix<string, u8>('p:');
-    }
+export class IdenaSocialMod {
+    // The class keeps no fields (see the maps above). The constructor is what makes the SDK export `deploy`.
+    constructor() {}
 
     // Bans `address` for `epochs` epochs, or permanently when 0. Moderators can't be banned: stakers never, and a
     // vouched moderator only once a staker has revoked their vouches.
@@ -217,9 +218,10 @@ export class IdenaSocialMod {
         util.assert(args.epochs <= MAX_BAN_EPOCHS, 'ban is too long');
         requireValidReason(args.reason);
         this.requireNotBanned(caller);
-        util.assert(!this.isVouched(toKey(target)), 'cannot ban a moderator');
+        util.assert(!this.isKnownModerator(toKey(target)), 'cannot ban a moderator');
 
-        // Check the target isn't a staker, then that the caller is a moderator.
+        // Check the target isn't a staker, then that the caller is a moderator. The target is always looked up: only
+        // confirmed stakers are remembered, so an address that isn't one could have staked since.
         const callbackArgs: Bytes[] = [
             caller.toBytes(),
             target.toBytes(),
@@ -233,7 +235,7 @@ export class IdenaSocialMod {
     @privateMethod
     _banCheckTarget(caller: Address, target: Address, epochs: u32, gasLimit: u32, reason: string = ''): void {
         util.assert(!lookedUpIdentityHasModeratorStake(), 'cannot ban a moderator');
-        if (this.isVouched(toKey(caller))) {
+        if (this.isKnownModerator(toKey(caller))) {
             this.applyBan(target, caller, epochs, reason);
         } else {
             const callbackArgs: Bytes[] = [
@@ -249,7 +251,7 @@ export class IdenaSocialMod {
 
     @privateMethod
     _banAsStaker(caller: Address, target: Address, epochs: u32, gasLimit: u32, reason: string = ''): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only moderators can ban');
+        this.requireLookedUpStake(caller, 'only moderators can ban');
         this.applyBan(target, caller, epochs, reason);
     }
 
@@ -261,7 +263,7 @@ export class IdenaSocialMod {
         this.requireNotBanned(caller);
         util.assert(this.isBanned(target), 'address is not banned');
 
-        if (this.isVouched(toKey(caller))) {
+        if (this.isKnownModerator(toKey(caller))) {
             this.applyUnban(target, caller, args.reason);
         } else {
             const callbackArgs: Bytes[] = [caller.toBytes(), target.toBytes(), Bytes.fromString(args.reason)];
@@ -271,7 +273,7 @@ export class IdenaSocialMod {
 
     @privateMethod
     _unbanAsStaker(caller: Address, target: Address, reason: string = ''): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only moderators can unban');
+        this.requireLookedUpStake(caller, 'only moderators can unban');
         this.applyUnban(target, caller, reason);
     }
 
@@ -285,7 +287,7 @@ export class IdenaSocialMod {
         this.requireNotBanned(caller);
         util.assert(!this.isTransactionBanned(hash), 'transaction is already banned');
 
-        if (this.isVouched(toKey(caller))) {
+        if (this.isKnownModerator(toKey(caller))) {
             this.applyTransactionBan(hash, caller, args.reason);
         } else {
             const callbackArgs: Bytes[] = [caller.toBytes(), hash, Bytes.fromString(args.reason)];
@@ -295,7 +297,7 @@ export class IdenaSocialMod {
 
     @privateMethod
     _banTransactionAsStaker(caller: Address, hash: Bytes, reason: string = ''): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only moderators can ban transactions');
+        this.requireLookedUpStake(caller, 'only moderators can ban transactions');
         this.applyTransactionBan(hash, caller, reason);
     }
 
@@ -313,7 +315,7 @@ export class IdenaSocialMod {
         const hashes = new Uint8Array(count * HASH_LENGTH);
         for (let i = 0; i < count; i++) hashes.set(parseTransactionHash(args.hashes[i]), i * HASH_LENGTH);
 
-        if (this.isVouched(toKey(caller))) {
+        if (this.isKnownModerator(toKey(caller))) {
             this.applyTransactionBans(hashes, caller, args.reason);
         } else {
             const gasLimit = args._gasLimit > 0 ? args._gasLimit : DEFAULT_CALLBACK_GAS + GAS_PER_BATCHED_BAN * u32(count);
@@ -324,7 +326,7 @@ export class IdenaSocialMod {
 
     @privateMethod
     _banTransactionsAsStaker(caller: Address, hashes: Bytes, reason: string = ''): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only moderators can ban transactions');
+        this.requireLookedUpStake(caller, 'only moderators can ban transactions');
         this.applyTransactionBans(hashes, caller, reason);
     }
 
@@ -336,7 +338,7 @@ export class IdenaSocialMod {
         this.requireNotBanned(caller);
         util.assert(this.isTransactionBanned(hash), 'transaction is not banned');
 
-        if (this.isVouched(toKey(caller))) {
+        if (this.isKnownModerator(toKey(caller))) {
             this.applyTransactionUnban(hash, caller, args.reason);
         } else {
             const callbackArgs: Bytes[] = [caller.toBytes(), hash, Bytes.fromString(args.reason)];
@@ -346,12 +348,12 @@ export class IdenaSocialMod {
 
     @privateMethod
     _unbanTransactionAsStaker(caller: Address, hash: Bytes, reason: string = ''): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only moderators can unban transactions');
+        this.requireLookedUpStake(caller, 'only moderators can unban transactions');
         this.applyTransactionUnban(hash, caller, reason);
     }
 
-    // Reports an address to the moderators. Reports are only emitted as events, for the idena.social API to collect;
-    // nothing is stored. Anyone without an active ban can report, and a reason is required.
+    // Reports an address to the moderators. Reports are only emitted as events; nothing is stored. Anyone without an
+    // active ban can report, and a reason is required.
     report(args: ReportArgs): void {
         const caller = Context.caller();
         const target = parseAddress(args.address);
@@ -377,21 +379,20 @@ export class IdenaSocialMod {
         this.requireNotBanned(caller);
         util.assert(!this.isBanned(target), 'cannot vouch for a banned address');
         util.assert(!this.hasVouched(caller, target), 'already vouched');
-        util.assert(addressCount(this.currentVouches(caller)) < MAX_VOUCHES, 'vouch limit reached');
+        const callerVouches = this.currentVouches(caller);
+        util.assert(addressCount(callerVouches) < MAX_VOUCHES, 'vouch limit reached');
 
-        lookupIdentity(caller, '_vouchAsStaker', [caller.toBytes(), target.toBytes()], args._gasLimit);
+        if (this.hasConfirmedStake(toKey(caller))) {
+            this.applyVouch(target, caller, callerVouches);
+        } else {
+            lookupIdentity(caller, '_vouchAsStaker', [caller.toBytes(), target.toBytes()], args._gasLimit);
+        }
     }
 
     @privateMethod
     _vouchAsStaker(caller: Address, target: Address): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only identities with 1M+ iDNA stake can vouch');
-
-        this.vouchesGiven.set(toKey(caller), withAddress(this.currentVouches(caller), target));
-        this.vouchRecords.set(vouchKey(target, caller), 1);
-        const targetKey = toKey(target);
-        const vouchers = withAddress(this.vouchers.get(targetKey, new Uint8Array(0)), caller);
-        this.vouchers.set(targetKey, vouchers);
-        Host.emitEvent('vouch', [target.toBytes(), caller.toBytes(), Bytes.fromU32(addressCount(vouchers))]);
+        this.requireLookedUpStake(caller, 'only identities with 1M+ iDNA stake can vouch');
+        this.applyVouch(target, caller, this.currentVouches(caller));
     }
 
     // Withdraws the caller's own vouch. Allowed even if the caller is banned or no longer a staker.
@@ -400,14 +401,14 @@ export class IdenaSocialMod {
         const target = parseAddress(args.address);
         util.assert(this.hasVouched(caller, target), 'no vouch to withdraw');
 
-        this.vouchRecords.delete(vouchKey(target, caller));
+        vouchRecords.delete(vouchKey(target, caller));
         const targetKey = toKey(target);
-        let vouchers = this.vouchers.get(targetKey, new Uint8Array(0));
-        vouchers = withoutAddressAt(vouchers, addressIndex(vouchers, caller));
-        this.setList(this.vouchers, targetKey, vouchers);
+        let targetVouchers = vouchers.get(targetKey, new Uint8Array(0));
+        targetVouchers = withoutAddressAt(targetVouchers, addressIndex(targetVouchers, caller));
+        this.setList(vouchers, targetKey, targetVouchers);
         // With the vouch record gone, currentVouches leaves the target out.
-        this.setList(this.vouchesGiven, toKey(caller), this.currentVouches(caller));
-        Host.emitEvent('vouchWithdrawn', [target.toBytes(), caller.toBytes(), Bytes.fromU32(addressCount(vouchers))]);
+        this.setList(vouchesGiven, toKey(caller), this.currentVouches(caller));
+        Host.emitEvent('vouchWithdrawn', [target.toBytes(), caller.toBytes(), Bytes.fromU32(addressCount(targetVouchers))]);
     }
 
     // Removes every vouch for `address`, whoever made them, which frees those vouchers' slots. Only stakers can do this.
@@ -416,46 +417,63 @@ export class IdenaSocialMod {
         const target = parseAddress(args.address);
         this.requireNotBanned(caller);
         util.assert(this.isVouched(toKey(target)), 'address has no vouches');
-        lookupIdentity(caller, '_revokeVouchesAsStaker', [caller.toBytes(), target.toBytes()], args._gasLimit);
+
+        if (this.hasConfirmedStake(toKey(caller))) {
+            this.applyRevokeVouches(target, caller);
+        } else {
+            lookupIdentity(caller, '_revokeVouchesAsStaker', [caller.toBytes(), target.toBytes()], args._gasLimit);
+        }
     }
 
     @privateMethod
     _revokeVouchesAsStaker(caller: Address, target: Address): void {
-        util.assert(lookedUpIdentityHasModeratorStake(), 'only identities with 1M+ iDNA stake can revoke vouches');
-        const targetKey = toKey(target);
-        const vouchers = this.vouchers.get(targetKey, new Uint8Array(0));
-        const revoked = addressCount(vouchers);
-        for (let i = 0; i < i32(revoked); i++) {
-            this.vouchRecords.delete(vouchKey(target, addressAt(vouchers, i)));
-        }
-        this.vouchers.delete(targetKey);
-        Host.emitEvent('vouchesRevoked', [target.toBytes(), caller.toBytes(), Bytes.fromU32(revoked)]);
+        this.requireLookedUpStake(caller, 'only identities with 1M+ iDNA stake can revoke vouches');
+        this.applyRevokeVouches(target, caller);
     }
 
     @view
     isBanned(address: Address): bool {
-        return isBanActive(this.bans.get(toKey(address), new Ban()));
+        return isBanActive(bans.get(toKey(address), new Ban()));
     }
 
     @view
     isTransactionBanned(hash: Bytes): bool {
-        return this.transactionBans.get(toKey(hash), new TransactionBan()).moderator != '';
+        return transactionBans.get(toKey(hash), new TransactionBan()).moderator != '';
     }
 
     // Moderators by vouch have a count above 0. Moderators by stake can't be checked here: stake is only readable
     // through an async identity lookup.
     @view
     vouchCount(address: Address): u32 {
-        return addressCount(this.vouchers.get(toKey(address), new Uint8Array(0)));
+        return addressCount(vouchers.get(toKey(address), new Uint8Array(0)));
     }
 
     @view
     hasVouched(voucher: Address, address: Address): bool {
-        return this.vouchRecords.get(vouchKey(address, voucher), 0) != 0;
+        return vouchRecords.get(vouchKey(address, voucher), 0) != 0;
     }
 
     private isVouched(addressKey: string): bool {
-        return this.vouchers.get(addressKey, new Uint8Array(0)).length > 0;
+        return vouchers.get(addressKey, new Uint8Array(0)).length > 0;
+    }
+
+    // Whether an identity lookup has found the address with moderator stake this epoch.
+    private hasConfirmedStake(addressKey: string): bool {
+        const epoch = Context.epoch();
+        // The default only has to differ from the current epoch.
+        return stakeEpochs.get(addressKey, u16(epoch + 1)) == epoch;
+    }
+
+    // A moderator that needs no identity lookup: vouched, or confirmed as a staker this epoch.
+    private isKnownModerator(addressKey: string): bool {
+        return this.isVouched(addressKey) || this.hasConfirmedStake(addressKey);
+    }
+
+    // Only valid inside a `lookupIdentity` callback for `address`. Fails with `error` unless the identity has moderator
+    // stake, and otherwise remembers that for the rest of the epoch.
+    private requireLookedUpStake(address: Address, error: string): void {
+        util.assert(lookedUpIdentityHasModeratorStake(), error);
+        stakeEpochs.set(toKey(address), Context.epoch());
     }
 
     private requireNotBanned(address: Address): void {
@@ -479,7 +497,7 @@ export class IdenaSocialMod {
 
     // The addresses `voucher` has vouched for whose vouch is still in effect.
     private currentVouches(voucher: Address): Uint8Array {
-        const stored = this.vouchesGiven.get(toKey(voucher), new Uint8Array(0));
+        const stored = vouchesGiven.get(toKey(voucher), new Uint8Array(0));
         let current = new Uint8Array(0);
         for (let i = 0; i < i32(addressCount(stored)); i++) {
             const address = addressAt(stored, i);
@@ -496,7 +514,7 @@ export class IdenaSocialMod {
         ban.permanent = epochs == 0;
         ban.endEpoch = epochs == 0 ? 0 : u32(epoch) + epochs;
         ban.reason = reason;
-        this.bans.set(toKey(target), ban);
+        bans.set(toKey(target), ban);
         Host.emitEvent('ban', [
             target.toBytes(),
             moderator.toBytes(),
@@ -507,12 +525,33 @@ export class IdenaSocialMod {
         ]);
     }
 
+    // `voucherVouches` is the voucher's current vouches, before this one.
+    private applyVouch(target: Address, voucher: Address, voucherVouches: Uint8Array): void {
+        vouchesGiven.set(toKey(voucher), withAddress(voucherVouches, target));
+        vouchRecords.set(vouchKey(target, voucher), 1);
+        const targetKey = toKey(target);
+        const targetVouchers = withAddress(vouchers.get(targetKey, new Uint8Array(0)), voucher);
+        vouchers.set(targetKey, targetVouchers);
+        Host.emitEvent('vouch', [target.toBytes(), voucher.toBytes(), Bytes.fromU32(addressCount(targetVouchers))]);
+    }
+
+    private applyRevokeVouches(target: Address, staker: Address): void {
+        const targetKey = toKey(target);
+        const targetVouchers = vouchers.get(targetKey, new Uint8Array(0));
+        const revoked = addressCount(targetVouchers);
+        for (let i = 0; i < i32(revoked); i++) {
+            vouchRecords.delete(vouchKey(target, addressAt(targetVouchers, i)));
+        }
+        vouchers.delete(targetKey);
+        Host.emitEvent('vouchesRevoked', [target.toBytes(), staker.toBytes(), Bytes.fromU32(revoked)]);
+    }
+
     private applyTransactionBan(hash: Bytes, moderator: Address, reason: string): void {
         const ban = new TransactionBan();
         ban.moderator = toKey(moderator);
         ban.epoch = Context.epoch();
         ban.reason = reason;
-        this.transactionBans.set(toKey(hash), ban);
+        transactionBans.set(toKey(hash), ban);
         Host.emitEvent('banTransaction', [hash, moderator.toBytes(), Bytes.fromU16(ban.epoch), Bytes.fromString(reason)]);
     }
 
@@ -525,12 +564,12 @@ export class IdenaSocialMod {
     }
 
     private applyTransactionUnban(hash: Bytes, moderator: Address, reason: string): void {
-        this.transactionBans.delete(toKey(hash));
+        transactionBans.delete(toKey(hash));
         Host.emitEvent('unbanTransaction', [hash, moderator.toBytes(), Bytes.fromString(reason)]);
     }
 
     private applyUnban(target: Address, moderator: Address, reason: string): void {
-        this.bans.delete(toKey(target));
+        bans.delete(toKey(target));
         Host.emitEvent('unban', [target.toBytes(), moderator.toBytes(), Bytes.fromString(reason)]);
     }
 }

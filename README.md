@@ -2,15 +2,15 @@
 
 Content moderation smart contract for idena.social.
 
-It's an on-chain record of moderation decisions: which addresses and which transactions are banned, and who the moderators are. Users can also report addresses and transactions to the moderators. It doesn't hide anything itself; the idena.social UI or API reads it and decides what to show. It has no owner or admin: everything is governed by stake and vouches.
+It's an on-chain record of moderation decisions: which addresses and which transactions are banned, and who the moderators are. Users can also report addresses and transactions to the moderators. It doesn't hide anything itself; the idena.social UI reads it and decides what to show. It has no owner or admin: everything is governed by stake and vouches.
 
-Smart Contract is live: https://scan.idena.io/contract/0x2D063782FC18Fe29be8aaF65df9CDd3a1c53Bf6d
+Smart Contract is live: https://scan.idena.io/contract/0x8A44bA305c09375F6a1f553920e49daE4875A5E5
 
 ## Who can do what
 
 There are two kinds of moderator:
 
-- **Stakers:** any identity with at least 1,000,000 iDNA staked. Stake is checked live on every action, so this updates on its own as stakes change.
+- **Stakers:** any identity with at least 1,000,000 iDNA staked. The contract checks stake on a staker's first action in an epoch and trusts the result for the rest of that epoch (see [Asynchronous checks](#asynchronous-checks)), so this updates on its own as stakes change.
 - **Vouched moderators:** any address that at least one staker has vouched for.
 
 | Action | Staker | Vouched moderator |
@@ -31,7 +31,8 @@ Anyone who isn't banned, moderator or not, can **report** an address or a transa
 - **Banned addresses can't moderate.** They can't ban or unban (addresses or transactions), vouch or revoke, and can't be vouched for. They can still withdraw vouches they made.
 - **Transaction bans cover any transaction** (a post, reply, message or any other idena.social action), including a moderator's, because the contract can't see who sent a transaction. Only that piece of content is affected, not the sender.
 - **Address bans expire by themselves** at their end epoch. Banning an already-banned address replaces the old ban.
-- **Reports are only events.** Nothing is stored, so the contract doesn't count or deduplicate them; the idena.social API collects them from the `report` and `reportTransaction` events. A report doesn't ban anything by itself.
+- **Reports are only events.** Nothing is stored, so the contract doesn't count or deduplicate them; they're read from the `report` and `reportTransaction` events. A report doesn't ban anything by itself.
+- **Stake is confirmed once per epoch.** Once an identity lookup has found 1M+ stake, the address counts as a staker until the epoch ends. Stake can still drop mid-epoch if the identity is killed; it then keeps a staker's powers until the next epoch. A failed check isn't remembered, so stake added mid-epoch counts from the next action.
 - **Vouches persist** if the voucher's stake later drops. Withdrawing a vouch, or a staker revoking it, frees the voucher's slot.
 - **Guards:** you can't ban, vouch for or report yourself, and reasons are capped at 280 UTF-8 bytes.
 - **Send 0 iDNA.** The contract never reads the amount sent with a call: idena-go gives a call that sends nothing a nil amount, and reading it fails the call on mainnet (the contract runner doesn't reproduce this). iDNA sent anyway stays in the contract, which can't pay it out.
@@ -57,15 +58,17 @@ Each method takes one JSON string argument, like the idena.social contract. `add
 
 Stake can only be read through an identity lookup promise, so a check that depends on stake runs in a callback. A callback that rejects the action does **not** fail the transaction: the receipt still says `success: true`. To confirm an action took effect, look for its event; the rejection reason is in `actionResult.subActionResults[].error`.
 
-`ban` always looks up the target (to make sure it isn't a staker), and then the caller too unless they're a vouched moderator. `unban`, `banTransaction`, `banTransactions` and `unbanTransaction` look up the caller unless they're a vouched moderator. `vouch` and `revokeVouches` always look up the caller.
+A staker is only looked up on their first action in an epoch. A lookup that finds 1M+ stake records the epoch in `s:`, and for the rest of that epoch the staker's actions skip the lookup and run inside the call itself, like a vouched moderator's. A rejected action then fails the transaction as usual.
+
+`ban` looks up the target to make sure it isn't a staker. This can't be skipped, since only confirmed stakers are recorded and an address that wasn't one may have staked since. A target already confirmed this epoch is rejected outright. `ban` then looks up the caller too, unless they're a vouched moderator or a staker confirmed this epoch. `unban`, `banTransaction`, `banTransactions` and `unbanTransaction` look up the caller on the same condition. `vouch` and `revokeVouches` look up the caller unless they're a staker confirmed this epoch.
 
 The callbacks (the methods starting with `_`) can't be called directly: the VM refuses `_` methods outside a callback, and `@privateMethod` also checks that the caller is the contract itself.
 
-Each callback gets `_gasLimit` wasm gas, which defaults to 4,000,000 and can be set in the argument. That covers every callback with room to spare, with one exception: vouching for or revoking an address costs about 60,000 more for each voucher it already has. The default works up to roughly 40 existing vouchers for `vouch` and 60 for `revokeVouches`; beyond that, pass a higher `_gasLimit`.
+Each callback gets `_gasLimit` wasm gas, which defaults to 4,000,000 and can be set in the argument. That covers every callback with room to spare, with one exception: vouching for or revoking an address costs about 60,000 more for each voucher it already has. The default works up to roughly 50 existing vouchers for `vouch` and 65 for `revokeVouches`; beyond that, pass a higher `_gasLimit`.
 
-`banTransactions` sizes its callback gas automatically: 4,000,000 plus 2,000,000 per transaction, unless `_gasLimit` is set. Most of a transaction ban's cost is writing its reason, which is stored with every banned transaction: from about 500,000 wasm gas per transaction with no reason to about 1,400,000 with a maximum-length one. A full batch of 100 with long reasons uses about 130M wasm gas, roughly a quarter of a block. A vouched moderator's batch runs inside the call itself, so it simply needs a `maxFee` that covers it.
+`banTransactions` sizes its callback gas automatically: 4,000,000 plus 2,000,000 per transaction, unless `_gasLimit` is set. Most of a transaction ban's cost is writing its reason, which is stored with every banned transaction: from about 500,000 wasm gas per transaction with no reason to about 1,400,000 with a maximum-length one. A full batch of 100 with long reasons uses about 130M wasm gas, roughly a quarter of a block. A batch that needs no lookup (from a vouched moderator, or a staker confirmed this epoch) runs inside the call itself, so it simply needs a `maxFee` that covers it.
 
-Only gas actually used is charged, but the transaction's `maxFee` has to cover the reservation: up to `2 × _gasLimit` for `ban`, and about 204M wasm gas for a full `banTransactions` batch from a staker.
+Only gas actually used is charged, but the transaction's `maxFee` has to cover the reservation: up to `2 × _gasLimit` for `ban`, and about 204M wasm gas for a full `banTransactions` batch from a staker who hasn't been confirmed this epoch. A call that makes no lookup reserves nothing.
 
 ## Reading state
 
@@ -78,10 +81,11 @@ Read state with `contract_readMap(contract, map, key, format)`. Keys use lowerca
 | `m:` | address | `hex` | **Who vouched for the address**, as an address list. The address is a vouched moderator while the list is non-empty; it's removed once empty. |
 | `v:` | voucher | `hex` | The addresses a staker has vouched for, as an address list. After a revocation an address can linger here until the list next changes; it only counts while `m:<that address>` still lists the staker. |
 | `p:` | `<address>:<voucher>` | `hex` | `0x01` while that vouch is in effect. The contract uses it to check vouches without reading whole lists. |
+| `s:` | address | `hex` | The epoch (u16, little-endian) in which an identity lookup last found the address with 1M+ stake. While it's the current epoch, the address acts as a staker without a lookup. |
 
 An address list is 20-byte addresses back to back, so split the hex after `0x` into 40-character chunks. Lists are stored as bytes rather than JSON because the chain charges for every byte read and written.
 
-Whether an address is a staker isn't stored. Check its stake with the `dna_identity` RPC.
+`s:` only records stakers who have acted, so it isn't a list of stakers. Check an address's stake with the `dna_identity` RPC.
 
 The `@view` methods (`isBanned`, `isTransactionBanned`, `vouchCount`, `hasVouched`) are for other contracts to call through `createCallFunctionPromise`. The node's `contract_readonlyCall` only supports built-in contracts.
 
@@ -125,3 +129,7 @@ yarn test   # builds both targets, then runs jest
 ```
 
 The runner can't give identities stake, so `yarn asbuild:test` also produces `build/test/idena.social-mod.wasm`. In that build the stake threshold is 0, which makes every address a staker. Tests that need stakers run against it; everything else runs against the release build. The test build is for testing only; never deploy it.
+
+## License
+
+[MIT](LICENSE)
